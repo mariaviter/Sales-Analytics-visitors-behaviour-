@@ -1,0 +1,137 @@
+
+#Спочатку отримує кількість створених акаунтів
+#Групування за датою створення акаунту, країною, інтервалом відправлення, верифікацією та статусом підписки
+
+WITH account as (
+ SELECT s.date, sp.country, ac.send_interval, ac.is_verified, ac.is_unsubscribed,
+ COUNT (distinct ac.id) as account_cnt
+ FROM `data-analytics-mate.DA.account` ac
+ JOIN `data-analytics-mate.DA.account_session` acs
+ ON ac.id = acs.account_id
+ JOIN `data-analytics-mate.DA.session` s
+ ON acs.ga_session_id = s.ga_session_id
+ JOIN `data-analytics-mate.DA.session_params` sp
+ ON s.ga_session_id = sp.ga_session_id
+ GROUP BY s.date, sp.country,  ac.send_interval, ac.is_verified, ac.is_unsubscribed),
+
+#Отримання метрик по імейлам
+#Групування за датою відправки листа (sent_date), країною, інтервалом, верифікацією та статусом підписки
+#Вимірюються: кількість відправлених, відкритих листів і переходів по ним
+
+ email_metrics as (
+ SELECT
+ DATE_ADD(s.date, INTERVAL es.sent_date DAY) as sent_date,
+sp.country,
+ac.send_interval, ac.is_verified, ac.is_unsubscribed,
+COUNT (distinct es.id_message) as sent_msg,
+COUNT (distinct eo.id_message) as open_msg,
+COUNT (distinct ev.id_message) as visit_msg
+FROM `data-analytics-mate.DA.email_sent` es
+LEFT JOIN `data-analytics-mate.DA.email_open` eo
+ON es.id_message = eo.id_message
+LEFT JOIN `data-analytics-mate.DA.email_visit` ev
+ON es.id_message = ev.id_message
+JOIN `data-analytics-mate.DA.account` ac
+ON ac.id = es.id_account
+JOIN `data-analytics-mate.DA.account_session` acs
+ON es.id_account = acs.account_id
+JOIN `data-analytics-mate.DA.session` s
+ON acs.ga_session_id = s.ga_session_id
+JOIN `data-analytics-mate.DA.session_params` sp
+ON s.ga_session_id = sp.ga_session_id
+GROUP BY sent_date, sp.country, ac.send_interval, ac.is_verified, ac.is_unsubscribed ),
+
+#За допомогою юніонів об'єднуємо данні з верхніх СТЕ по створеним аккаунтам та листам в один СТЕ
+
+unions as (
+SELECT date,
+country,
+send_interval,
+is_verified,
+is_unsubscribed,
+account_cnt,
+0 as sent_msg,
+0 as open_msg,
+0 as visit_msg
+FROM account
+UNION ALL
+SELECT sent_date as date,
+country,
+send_interval,
+is_verified,
+is_unsubscribed,
+0 as account_cnt,
+sent_msg,
+open_msg,
+visit_msg
+FROM email_metrics
+),
+
+#Агрегуємо об’єднані метрики, сумуємо значення по кожній комбінації розрізів (таким чином прибираємо зайві записи з нулями)
+
+final_groups as (
+SELECT date,
+country,
+send_interval,
+is_verified,
+is_unsubscribed,
+SUM (account_cnt) as account_cnt,
+SUM (sent_msg) as sent_msg,
+SUM (open_msg) as open_msg,
+SUM (visit_msg) as visit_msg
+FROM unions
+GROUP BY date, country, send_interval, is_verified, is_unsubscribed
+),
+
+#Обчислюжмо загальні суми по країнам, додаємо тотальні метрики по країнам для подальшого ранжування
+
+sums as (
+SELECT date,
+country,
+account_cnt,
+sent_msg,
+open_msg,
+visit_msg,
+   SUM(account_cnt) OVER (PARTITION BY country) AS total_country_account_cnt,
+   SUM(sent_msg) OVER (PARTITION BY country) AS total_country_sent_cnt
+FROM final_groups
+),
+
+#Ранжуємо країни за загальною кількістю акаунтів і емейлів
+#Визначаємо рейтинг країн
+
+sums_final as (
+SELECT date,
+country,
+ account_cnt,
+ sent_msg,
+ open_msg,
+ visit_msg,
+ total_country_account_cnt,
+ total_country_sent_cnt,
+DENSE_RANK() OVER (ORDER BY total_country_account_cnt DESC) AS rank_total_country_account_cnt,
+   DENSE_RANK() OVER (ORDER BY total_country_sent_cnt DESC) AS rank_total_country_sent_cnt
+FROM sums
+)
+
+#Фінальна вибірка. Повертаємо лише країни, що входять у топ-10 за кількістю акаунтів або імейл-активністю
+
+SELECT *
+FROM sums_final
+WHERE rank_total_country_account_cnt <= 10 OR rank_total_country_sent_cnt <= 10;
+
+
+#В кінцевому результаті маємо табличку з такими стовпцями:
+#date — дата;
+#country — країна;
+#send_interval — інтервал відправлення;
+#is_verified — перевірено акаунт чи ні;
+#is_unsubscribed — підписник відписався;
+#account_cnt — кількість створених акаунтів;
+#sent_msg — кількість відправлених листів;
+#open_msg — кількість відкритих листів;
+#visit_msg — кількість переходів по листах;
+#total_country_account_cnt — загальна кількість створених підписників по країні;
+#total_country_sent_cnt — загальна кількість відправлених листів по країні;
+#rank_total_country_account_cnt — рейтинг країн за кількістю створених підписників;
+#rank_total_country_sent_cnt — рейтинг країн за кількістю відправлених листів.
